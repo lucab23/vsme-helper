@@ -1,10 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import vsmeData from "@/data/vsme-data.json";
 import { useAppState } from "@/lib/useAppState";
 import {
-  Category,
   Datapoint,
   DatapointAnswer,
   Group,
@@ -12,18 +11,20 @@ import {
   VsmeData,
   isAnswered,
 } from "@/lib/types";
-import { applicabilityFor } from "@/lib/applicability";
+import { applicabilityFor, Applicability } from "@/lib/applicability";
+import { buildDisclosurePages, DisclosurePage } from "@/lib/disclosures";
 
 const data = vsmeData as VsmeData;
 
-// Static map describing how each calculated row is derived. Day 3 will
-// actually do the math; for now we just explain it to the user.
 const CALCULATED_FROM: Record<string, string> = {
   "B3-08": "Calculated as (Scope 1 + Scope 2 emissions) / Turnover. Fill in B3-06, B3-07, and B1-08.",
   "B8-08": "Calculated from your HR records: (employees who left during year) / (average employees during year) × 100.",
   "B9-02": "Calculated as (number of accidents in B9-01) / (total hours worked) × 200,000.",
   "B10-02": "Calculated from payroll data as (avg male hourly pay − avg female hourly pay) / avg male hourly pay × 100.",
 };
+
+// All disclosure pages, computed once. We filter this per-user based on module.
+const ALL_PAGES = buildDisclosurePages(data.groups, data.datapoints);
 
 export default function Home() {
   const {
@@ -42,38 +43,493 @@ export default function Home() {
   const onboardingComplete = state.onboarding.module !== null;
 
   return (
-    <main className="mx-auto max-w-4xl p-8">
-      <header className="mb-8 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">VSME Helper</h1>
-          <p className="text-gray-600">
-            A free tool to help SMEs prepare a VSME-compliant sustainability report.
-          </p>
-        </div>
-        {onboardingComplete && (
-          <SaveLoadControls
-            exportState={exportState}
-            importState={importState}
-            resetAll={resetAll}
-          />
-        )}
-      </header>
-
+    <main className="min-h-screen">
       {!onboardingComplete ? (
-        <OnboardingForm onComplete={(answers) => setOnboarding(answers)} />
+        <div className="mx-auto max-w-3xl p-8">
+          <Header showControls={false} />
+          <OnboardingForm onComplete={(answers) => setOnboarding(answers)} />
+        </div>
       ) : (
-        <Checklist
-          onboarding={state.onboarding}
+        <Wizard
+          state={state}
           getAnswer={getAnswer}
           setAnswer={setAnswer}
+          exportState={exportState}
+          importState={importState}
+          resetAll={resetAll}
         />
       )}
     </main>
   );
 }
 
+function Header({
+  showControls,
+  exportState,
+  importState,
+  resetAll,
+}: {
+  showControls: boolean;
+  exportState?: () => string;
+  importState?: (json: string) => void;
+  resetAll?: () => void;
+}) {
+  return (
+    <header className="mb-8 flex items-start justify-between gap-4">
+      <div>
+        <h1 className="text-3xl font-bold">VSME Helper</h1>
+        <p className="text-gray-600">
+          A free tool to help SMEs prepare a VSME-compliant sustainability report.
+        </p>
+      </div>
+      {showControls && exportState && importState && resetAll && (
+        <SaveLoadControls
+          exportState={exportState}
+          importState={importState}
+          resetAll={resetAll}
+        />
+      )}
+    </header>
+  );
+}
+
 // ------------------------------------------------------------------
-// Save / Load / Reset controls
+// Wizard: sidebar + content
+// ------------------------------------------------------------------
+
+type WizardProps = {
+  state: ReturnType<typeof useAppState>["state"];
+  getAnswer: ReturnType<typeof useAppState>["getAnswer"];
+  setAnswer: ReturnType<typeof useAppState>["setAnswer"];
+  exportState: () => string;
+  importState: (json: string) => void;
+  resetAll: () => void;
+};
+
+function Wizard({
+  state,
+  getAnswer,
+  setAnswer,
+  exportState,
+  importState,
+  resetAll,
+}: WizardProps) {
+  // Filter pages by selected module
+  const pages = useMemo(() => {
+    return ALL_PAGES.filter((p) => {
+      if (state.onboarding.module === "Basic") return p.module === "Basic";
+      return true; // Comprehensive users see Basic + Comprehensive
+    });
+  }, [state.onboarding.module]);
+
+  const [currentCode, setCurrentCode] = useState<string>(pages[0]?.code ?? "B1");
+
+  // If filters change and the current page is no longer in the list,
+  // reset to the first available page.
+  useEffect(() => {
+    if (!pages.find((p) => p.code === currentCode)) {
+      setCurrentCode(pages[0]?.code ?? "B1");
+    }
+  }, [pages, currentCode]);
+
+  const currentIndex = pages.findIndex((p) => p.code === currentCode);
+  const currentPage = pages[currentIndex];
+
+  // Pre-compute applicability and progress per page so the sidebar can show counts
+  const pageStats = useMemo(() => {
+    const m = new Map<string, { total: number; done: number }>();
+    for (const page of pages) {
+      let total = 0;
+      let done = 0;
+      for (const gid of page.groupIds) {
+        const group = data.groups.find((g) => g.id === gid);
+        if (!group) continue;
+        for (const memberId of group.members) {
+          const dp = data.datapoints.find((d) => d.id === memberId);
+          if (!dp) continue;
+          const a = applicabilityFor(dp, state.onboarding);
+          if (a === "does-not-apply") continue;
+          if (dp.calculated) continue;
+          total += 1;
+          if (isAnswered(getAnswer(dp.id))) done += 1;
+        }
+      }
+      m.set(page.code, { total, done });
+    }
+    return m;
+  }, [pages, state.onboarding, getAnswer]);
+
+  // Overall progress across all pages
+  const overall = useMemo(() => {
+    let total = 0;
+    let done = 0;
+    for (const stats of pageStats.values()) {
+      total += stats.total;
+      done += stats.done;
+    }
+    return { total, done };
+  }, [pageStats]);
+
+  const goPrev = () => {
+    if (currentIndex > 0) {
+      setCurrentCode(pages[currentIndex - 1].code);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
+  const goNext = () => {
+    if (currentIndex < pages.length - 1) {
+      setCurrentCode(pages[currentIndex + 1].code);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
+
+  return (
+    <div className="mx-auto flex max-w-7xl gap-8 p-8">
+      {/* Sidebar */}
+      <aside className="sticky top-8 hidden w-64 shrink-0 self-start lg:block">
+        <Sidebar
+          pages={pages}
+          currentCode={currentCode}
+          onSelect={(code) => {
+            setCurrentCode(code);
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          pageStats={pageStats}
+          overall={overall}
+        />
+      </aside>
+
+      {/* Content */}
+      <div className="min-w-0 flex-1">
+        <Header
+          showControls
+          exportState={exportState}
+          importState={importState}
+          resetAll={resetAll}
+        />
+
+        {/* Mobile sidebar fallback: simple page selector */}
+        <div className="mb-6 lg:hidden">
+          <label className="mb-1 block text-sm font-medium text-gray-700">
+            Disclosure
+          </label>
+          <select
+            value={currentCode}
+            onChange={(e) => setCurrentCode(e.target.value)}
+            className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+          >
+            {pages.map((p) => {
+              const s = pageStats.get(p.code);
+              return (
+                <option key={p.code} value={p.code}>
+                  {p.code} — {p.title} ({s ? `${s.done}/${s.total}` : ""})
+                </option>
+              );
+            })}
+          </select>
+        </div>
+
+        {currentPage && (
+          <DisclosurePageView
+            page={currentPage}
+            onboarding={state.onboarding}
+            getAnswer={getAnswer}
+            setAnswer={setAnswer}
+          />
+        )}
+
+        <NavBar
+          currentIndex={currentIndex}
+          total={pages.length}
+          prev={pages[currentIndex - 1]}
+          next={pages[currentIndex + 1]}
+          onPrev={goPrev}
+          onNext={goNext}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------
+// Sidebar
+// ------------------------------------------------------------------
+
+function Sidebar({
+  pages,
+  currentCode,
+  onSelect,
+  pageStats,
+  overall,
+}: {
+  pages: DisclosurePage[];
+  currentCode: string;
+  onSelect: (code: string) => void;
+  pageStats: Map<string, { total: number; done: number }>;
+  overall: { total: number; done: number };
+}) {
+  // Group by module so we can show "Basic" / "Comprehensive" headings
+  const basicPages = pages.filter((p) => p.module === "Basic");
+  const comprehensivePages = pages.filter((p) => p.module === "Comprehensive");
+
+  return (
+    <nav className="space-y-6 text-sm">
+      {/* Overall progress */}
+      <div className="rounded border border-blue-200 bg-blue-50 p-3">
+        <div className="flex items-baseline justify-between">
+          <span className="text-xs font-medium text-blue-900">Overall progress</span>
+          <span className="text-xs text-blue-900">
+            {overall.done}/{overall.total}
+          </span>
+        </div>
+        <div className="mt-2 h-1.5 w-full overflow-hidden rounded bg-blue-100">
+          <div
+            className="h-full bg-blue-600 transition-all"
+            style={{
+              width: overall.total === 0 ? "0%" : `${(overall.done / overall.total) * 100}%`,
+            }}
+          />
+        </div>
+      </div>
+
+      {basicPages.length > 0 && (
+        <SidebarGroup
+          label="Basic Module"
+          pages={basicPages}
+          currentCode={currentCode}
+          onSelect={onSelect}
+          pageStats={pageStats}
+        />
+      )}
+
+      {comprehensivePages.length > 0 && (
+        <SidebarGroup
+          label="Comprehensive Module"
+          pages={comprehensivePages}
+          currentCode={currentCode}
+          onSelect={onSelect}
+          pageStats={pageStats}
+        />
+      )}
+    </nav>
+  );
+}
+
+function SidebarGroup({
+  label,
+  pages,
+  currentCode,
+  onSelect,
+  pageStats,
+}: {
+  label: string;
+  pages: DisclosurePage[];
+  currentCode: string;
+  onSelect: (code: string) => void;
+  pageStats: Map<string, { total: number; done: number }>;
+}) {
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-500">
+        {label}
+      </h3>
+      <ul className="space-y-0.5">
+        {pages.map((p) => {
+          const stats = pageStats.get(p.code);
+          const total = stats?.total ?? 0;
+          const done = stats?.done ?? 0;
+          const complete = total > 0 && done === total;
+          const active = p.code === currentCode;
+
+          return (
+            <li key={p.code}>
+              <button
+                onClick={() => onSelect(p.code)}
+                className={`flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left ${
+                  active
+                    ? "bg-gray-900 text-white"
+                    : "text-gray-700 hover:bg-gray-100"
+                }`}
+              >
+                <span className="flex items-center gap-2 truncate">
+                  <SidebarStatusDot complete={complete} active={active} hasProgress={done > 0} />
+                  <span className="truncate">
+                    <span className="font-mono">{p.code}</span>
+                    <span className={active ? "text-gray-300" : "text-gray-500"}>
+                      {" "}— {p.title}
+                    </span>
+                  </span>
+                </span>
+                <span
+                  className={`shrink-0 text-xs ${
+                    active ? "text-gray-300" : "text-gray-400"
+                  }`}
+                >
+                  {total > 0 ? `${done}/${total}` : "—"}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function SidebarStatusDot({
+  complete,
+  active,
+  hasProgress,
+}: {
+  complete: boolean;
+  active: boolean;
+  hasProgress: boolean;
+}) {
+  if (complete) {
+    return (
+      <span
+        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
+          active ? "bg-green-400 text-gray-900" : "bg-green-600 text-white"
+        }`}
+      >
+        ✓
+      </span>
+    );
+  }
+  if (hasProgress) {
+    return (
+      <span
+        className={`h-2 w-2 shrink-0 rounded-full ${
+          active ? "bg-blue-400" : "bg-blue-600"
+        }`}
+      />
+    );
+  }
+  return (
+    <span
+      className={`h-2 w-2 shrink-0 rounded-full ${
+        active ? "bg-gray-400" : "bg-gray-300"
+      }`}
+    />
+  );
+}
+
+// ------------------------------------------------------------------
+// Disclosure page (the main content area)
+// ------------------------------------------------------------------
+
+function DisclosurePageView({
+  page,
+  onboarding,
+  getAnswer,
+  setAnswer,
+}: {
+  page: DisclosurePage;
+  onboarding: ReturnType<typeof useAppState>["state"]["onboarding"];
+  getAnswer: ReturnType<typeof useAppState>["getAnswer"];
+  setAnswer: ReturnType<typeof useAppState>["setAnswer"];
+}) {
+  type Row = { dp: Datapoint; applicability: Applicability };
+
+  const groups = useMemo(() => {
+    const result: { group: Group; rows: Row[] }[] = [];
+    for (const gid of page.groupIds) {
+      const group = data.groups.find((g) => g.id === gid);
+      if (!group) continue;
+      const rows: Row[] = [];
+      for (const memberId of group.members) {
+        const dp = data.datapoints.find((d) => d.id === memberId);
+        if (!dp) continue;
+        const a = applicabilityFor(dp, onboarding);
+        // We still show "does-not-apply" rows here, just greyed; lets the user
+        // see what they were skipped from. Day 3 may revisit this.
+        rows.push({ dp, applicability: a });
+      }
+      if (rows.length === 0) continue;
+      result.push({ group, rows });
+    }
+    return result;
+  }, [page, onboarding]);
+
+  return (
+    <article>
+      <div className="mb-6">
+        <div className="font-mono text-sm text-gray-500">{page.code}</div>
+        <h2 className="text-2xl font-semibold">{page.title}</h2>
+      </div>
+
+      <div className="space-y-6">
+        {groups.map(({ group, rows }) => (
+          <div key={group.id}>
+            {/* Only show a group sub-header if the page has multiple groups */}
+            {groups.length > 1 && (
+              <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-600">
+                {group.disclosure}
+              </h3>
+            )}
+            <div className="space-y-3">
+              {rows.map((row) => (
+                <Row
+                  key={row.dp.id}
+                  dp={row.dp}
+                  applies={row.applicability !== "does-not-apply"}
+                  depends={row.applicability === "depends"}
+                  answer={getAnswer(row.dp.id)}
+                  onUpdate={(patch) => setAnswer(row.dp.id, patch)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+// ------------------------------------------------------------------
+// Bottom navigation bar
+// ------------------------------------------------------------------
+
+function NavBar({
+  currentIndex,
+  total,
+  prev,
+  next,
+  onPrev,
+  onNext,
+}: {
+  currentIndex: number;
+  total: number;
+  prev?: DisclosurePage;
+  next?: DisclosurePage;
+  onPrev: () => void;
+  onNext: () => void;
+}) {
+  return (
+    <div className="mt-12 flex items-center justify-between border-t border-gray-200 pt-6">
+      <button
+        onClick={onPrev}
+        disabled={!prev}
+        className="rounded border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {prev ? `← ${prev.code} ${prev.title}` : "← Previous"}
+      </button>
+      <span className="text-xs text-gray-500">
+        Step {currentIndex + 1} of {total}
+      </span>
+      <button
+        onClick={onNext}
+        disabled={!next}
+        className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+      >
+        {next ? `${next.code} ${next.title} →` : "Next →"}
+      </button>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------
+// Save / Load / Reset controls (unchanged)
 // ------------------------------------------------------------------
 
 function SaveLoadControls({
@@ -109,7 +565,6 @@ function SaveLoadControls({
       }
     };
     reader.readAsText(file);
-    // Reset the input so uploading the same file again still triggers onChange
     e.target.value = "";
   };
 
@@ -145,193 +600,7 @@ function SaveLoadControls({
 }
 
 // ------------------------------------------------------------------
-// Checklist
-// ------------------------------------------------------------------
-
-type ChecklistProps = {
-  onboarding: ReturnType<typeof useAppState>["state"]["onboarding"];
-  getAnswer: ReturnType<typeof useAppState>["getAnswer"];
-  setAnswer: ReturnType<typeof useAppState>["setAnswer"];
-};
-
-function Checklist({ onboarding, getAnswer, setAnswer }: ChecklistProps) {
-  const [categoryFilter, setCategoryFilter] = useState<Category | "All">("All");
-  const [hideExcluded, setHideExcluded] = useState(true);
-
-  type Row = { dp: Datapoint; applies: boolean; depends: boolean };
-
-  const groupsWithRows = useMemo(() => {
-    const result: { group: Group; rows: Row[] }[] = [];
-
-    for (const group of data.groups) {
-      const rows: Row[] = [];
-      for (const memberId of group.members) {
-        const dp = data.datapoints.find((d) => d.id === memberId);
-        if (!dp) continue;
-
-        const a = applicabilityFor(dp, onboarding);
-        if (a === "does-not-apply" && hideExcluded) continue;
-
-        rows.push({
-          dp,
-          applies: a !== "does-not-apply",
-          depends: a === "depends",
-        });
-      }
-      if (rows.length === 0) continue;
-      if (categoryFilter !== "All" && group.category !== categoryFilter) continue;
-
-      result.push({ group, rows });
-    }
-    return result;
-  }, [onboarding, categoryFilter, hideExcluded]);
-
-  // Progress: count applicable, non-calculated rows. Calculated rows are
-  // excluded from progress because the user can't directly fill them in.
-  const stats = useMemo(() => {
-    let total = 0;
-    let done = 0;
-    for (const { rows } of groupsWithRows) {
-      for (const row of rows) {
-        if (!row.applies) continue;
-        if (row.dp.calculated) continue;
-        total += 1;
-        if (isAnswered(getAnswer(row.dp.id))) done += 1;
-      }
-    }
-    return { total, done };
-  }, [groupsWithRows, getAnswer]);
-
-  return (
-    <section>
-      <div className="mb-6 rounded border border-blue-200 bg-blue-50 p-4">
-        <div className="flex items-baseline justify-between">
-          <span className="font-medium text-blue-900">Progress</span>
-          <span className="text-sm text-blue-900">
-            {stats.done} of {stats.total} datapoints completed
-          </span>
-        </div>
-        <div className="mt-2 h-2 w-full overflow-hidden rounded bg-blue-100">
-          <div
-            className="h-full bg-blue-600 transition-all"
-            style={{
-              width:
-                stats.total === 0 ? "0%" : `${(stats.done / stats.total) * 100}%`,
-            }}
-          />
-        </div>
-      </div>
-
-      <div className="mb-6 flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium text-gray-700">Filter:</span>
-        {(["All", "General", "Environmental", "Social", "Governance"] as const).map(
-          (cat) => (
-            <button
-              key={cat}
-              onClick={() => setCategoryFilter(cat)}
-              className={`rounded-full px-3 py-1 text-sm ${
-                categoryFilter === cat
-                  ? "bg-gray-900 text-white"
-                  : "bg-gray-100 text-gray-700 hover:bg-gray-200"
-              }`}
-            >
-              {cat}
-            </button>
-          )
-        )}
-        <label className="ml-auto flex items-center gap-2 text-sm text-gray-700">
-          <input
-            type="checkbox"
-            checked={hideExcluded}
-            onChange={(e) => setHideExcluded(e.target.checked)}
-          />
-          Hide excluded rows
-        </label>
-      </div>
-
-      <div className="space-y-3">
-        {groupsWithRows.map(({ group, rows }) => (
-          <GroupSection
-            key={group.id}
-            group={group}
-            rows={rows}
-            getAnswer={getAnswer}
-            setAnswer={setAnswer}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-// ------------------------------------------------------------------
-// Group section
-// ------------------------------------------------------------------
-
-function GroupSection({
-  group,
-  rows,
-  getAnswer,
-  setAnswer,
-}: {
-  group: Group;
-  rows: { dp: Datapoint; applies: boolean; depends: boolean }[];
-  getAnswer: ReturnType<typeof useAppState>["getAnswer"];
-  setAnswer: ReturnType<typeof useAppState>["setAnswer"];
-}) {
-  const [open, setOpen] = useState(false);
-
-  // Count applicable, non-calculated rows
-  const fillable = rows.filter((r) => r.applies && !r.dp.calculated);
-  const doneCount = fillable.filter((r) => isAnswered(getAnswer(r.dp.id))).length;
-
-  return (
-    <div className="rounded border border-gray-200">
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left hover:bg-gray-50"
-      >
-        <div className="flex-1">
-          <div className="font-medium text-gray-900">{group.disclosure}</div>
-          <div className="text-xs text-gray-500">
-            {group.category} · {fillable.length} datapoint
-            {fillable.length === 1 ? "" : "s"}
-          </div>
-        </div>
-        <div className="flex items-center gap-3 text-sm">
-          <span
-            className={
-              fillable.length > 0 && doneCount === fillable.length
-                ? "font-medium text-green-700"
-                : "text-gray-600"
-            }
-          >
-            {doneCount}/{fillable.length}
-          </span>
-          <span className="text-gray-400">{open ? "▾" : "▸"}</span>
-        </div>
-      </button>
-
-      {open && (
-        <div className="border-t border-gray-200 bg-gray-50 px-4 py-3">
-          {rows.map((row) => (
-            <Row
-              key={row.dp.id}
-              dp={row.dp}
-              applies={row.applies}
-              depends={row.depends}
-              answer={getAnswer(row.dp.id)}
-              onUpdate={(patch) => setAnswer(row.dp.id, patch)}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ------------------------------------------------------------------
-// Row with inline data entry
+// Row with inline data entry (unchanged)
 // ------------------------------------------------------------------
 
 function Row({
@@ -352,8 +621,8 @@ function Row({
 
   return (
     <div
-      className={`border-b border-gray-200 py-3 last:border-b-0 ${
-        !applies && !answer.notApplicable ? "opacity-50" : ""
+      className={`rounded border border-gray-200 bg-white p-4 ${
+        !applies && !answer.notApplicable ? "opacity-60" : ""
       }`}
     >
       <div className="flex items-start gap-3">
@@ -401,11 +670,10 @@ function Row({
           )}
 
           <div className="mt-1 text-xs text-gray-500">
-            {dp.paragraphRef} · {dp.dataType}
+            ¶{dp.paragraphRef} · {dp.dataType}
             {dp.unit && dp.unit !== "—" ? ` · ${dp.unit}` : ""}
           </div>
 
-          {/* Input area */}
           <div className="mt-3">
             {calc ? (
               <CalculatedField dp={dp} />
@@ -428,7 +696,6 @@ function Row({
             )}
           </div>
 
-          {/* Bottom row of meta actions */}
           {!calc && !answer.notApplicable && applies && (
             <button
               onClick={() => onUpdate({ notApplicable: true, value: "" })}
@@ -444,7 +711,7 @@ function Row({
 }
 
 // ------------------------------------------------------------------
-// Data input — chooses widget based on dataType
+// Data input (unchanged)
 // ------------------------------------------------------------------
 
 function DataInput({
@@ -503,17 +770,12 @@ function DataInput({
   }
 
   if (t === "yes-no + text") {
-    // Try to parse "yes|<text>" or "no|<text>"; default empty parts otherwise.
     const sep = value.indexOf("|");
     const yn = sep === -1 ? value : value.slice(0, sep);
     const txt = sep === -1 ? "" : value.slice(sep + 1);
 
-    const setYn = (next: string) => {
-      onChange(`${next}|${txt}`);
-    };
-    const setTxt = (next: string) => {
-      onChange(`${yn}|${next}`);
-    };
+    const setYn = (next: string) => onChange(`${next}|${txt}`);
+    const setTxt = (next: string) => onChange(`${yn}|${next}`);
 
     return (
       <div className="space-y-2">
@@ -562,8 +824,6 @@ function DataInput({
     );
   }
 
-  // Fallback for list / table / matrix / dropdown — handled properly on Day 3.
-  // For now, accept free text so the user can at least record their answer.
   return (
     <div>
       <textarea
