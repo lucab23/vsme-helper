@@ -11,26 +11,20 @@ import {
 const STORAGE_KEY = "vsme-helper-state-v1";
 
 const emptyAnswer: DatapointAnswer = {
-  applies: null,
-  checked: false,
   value: "",
+  notApplicable: false,
   note: "",
 };
 
 export function useAppState() {
-  // Start with initial state on the server; hydrate from localStorage in the
-  // browser. The `loaded` flag prevents flicker before hydration.
   const [state, setState] = useState<AppState>(initialAppState);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        setState(JSON.parse(raw) as AppState);
-      }
+      if (raw) setState(JSON.parse(raw) as AppState);
     } catch (err) {
-      // Corrupted state — fall back to defaults rather than crash
       console.error("Failed to read saved state, resetting", err);
     }
     setLoaded(true);
@@ -66,12 +60,18 @@ export function useAppState() {
 
   const resetAll = () => {
     setState(initialAppState);
+    // Clean storage immediately so a refresh truly starts fresh
+    localStorage.removeItem(STORAGE_KEY);
   };
 
-  // For Step 4 later: serialize/deserialize the whole state.
   const exportState = (): string => JSON.stringify(state, null, 2);
+
   const importState = (json: string) => {
     const parsed = JSON.parse(json) as AppState;
+    // Defensive: ensure required top-level keys exist before accepting
+    if (!parsed.onboarding || !parsed.answers) {
+      throw new Error("File does not look like a VSME Helper save.");
+    }
     setState(parsed);
   };
 

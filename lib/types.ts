@@ -34,7 +34,6 @@ export type VsmeData = {
   groups: Group[];
 };
 
-// User-facing onboarding answers. Keep this small and add only when needed.
 export type Onboarding = {
   module: ModuleType | null;
   employeeCount: number | null;
@@ -44,20 +43,15 @@ export type Onboarding = {
   hasHumanRightsPolicy: boolean | null;
 };
 
-// Per-datapoint user state. We split "applies" from "checked" so the user
-// can mark something as not-applicable and still see it greyed out, rather
-// than it disappearing entirely.
 export type DatapointAnswer = {
-  applies: boolean | null;   // null = not yet decided
-  checked: boolean;          // user has marked as data collected / done
-  value: string;             // raw input value (Day 3 will use this)
-  note: string;              // free-text note from the user
+  value: string;            // raw user input
+  notApplicable: boolean;   // user-marked "not applicable"
+  note: string;             // free-text note
 };
 
 export type AppState = {
   onboarding: Onboarding;
   answers: Record<string, DatapointAnswer>;
-  // Track when each row was last touched, so we can show "12 done out of 55"
   lastUpdated: string;
 };
 
@@ -75,3 +69,15 @@ export const initialAppState: AppState = {
   answers: {},
   lastUpdated: new Date(0).toISOString(),
 };
+
+/**
+ * A row counts as "done" if either:
+ *   - the user has marked it not-applicable, OR
+ *   - the value is non-empty (any non-whitespace input).
+ * Calculated rows are never "done" by user action — Day 3 will compute them.
+ */
+export function isAnswered(a: DatapointAnswer | undefined): boolean {
+  if (!a) return false;
+  if (a.notApplicable) return true;
+  return a.value.trim().length > 0;
+}
