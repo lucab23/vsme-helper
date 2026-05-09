@@ -670,7 +670,7 @@ function Row({
           )}
 
           <div className="mt-1 text-xs text-gray-500">
-            ¶{dp.paragraphRef} · {dp.dataType}
+            {dp.paragraphRef} · {dp.dataType}
             {dp.unit && dp.unit !== "—" ? ` · ${dp.unit}` : ""}
           </div>
 
